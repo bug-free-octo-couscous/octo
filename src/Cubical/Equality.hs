@@ -19,8 +19,8 @@ type Ctx = [(Name, Term)]
 -- Term size (used to derive eta-expansion fuel)
 --------------------------------------------------------------------------------
 
--- | Structural node count of a term.  Used as a lower bound on eta fuel so
--- that the fuel scales with the problem rather than being a magic constant.
+-- | Structural node count of a term.  Used to derive the initial fuel for
+-- 'etaEq': see 'initialFuel' for the termination argument.
 termSize :: Term -> Int
 termSize t = case t of
     TVar _               -> 1
@@ -50,8 +50,35 @@ termSize t = case t of
     TSnd p               -> 1 + termSize p
 
 -- | Starting fuel for an eta-equality check between two already-evaluated
--- terms.  We use the combined term size as the base, with a minimum floor of
--- 16 so trivially small terms still get a reasonable number of steps.
+-- terms.  We use the combined structural node count as the bound, with a
+-- minimum floor of 16 so trivially small terms still get reasonable headroom.
+--
+-- == Why this bound is valid
+--
+-- Every fuel-consuming step in 'etaEq' is gated by a specific constructor
+-- node on one of the two input terms:
+--
+--   * 'PApp' boundary reduction  — triggered by a 'PApp' node on one side.
+--   * Lambda \/ 'PLam' eta expansion — triggered by a 'TAbs' or 'PLam' node.
+--   * Sigma eta expansion         — triggered by a 'TPair' node.
+--
+-- Each such node can trigger at most one fuel-consuming step, because the
+-- step either eliminates the node (boundary reduction) or peels it off and
+-- recurses into the body (eta expansion), so the same node cannot fire again
+-- in any recursive call.  The total number of fuel-consuming steps is
+-- therefore bounded by the total number of those constructor nodes, which is
+-- at most @termSize t1 + termSize t2@.
+--
+-- == Why term-size growth does not defeat the bound
+--
+-- One-sided lambda eta expansion replaces the neutral side @N@ with
+-- @TApp (shift 1 0 N) (TVar 0)@.  Since 'shift' is size-preserving,
+-- this adds exactly 2 nodes ('TApp' and 'TVar').  The total term size
+-- therefore grows by 2 per one-sided step — a size-decrease argument would
+-- fail.  The per-node argument above is not affected, because neither of the
+-- 2 new nodes ('TApp', 'TVar') is a 'TAbs', 'PLam', 'PApp', or 'TPair', so
+-- they cannot trigger a fuel-consuming step.  They will be handled by the
+-- no-fuel structural congruence cases.
 initialFuel :: Term -> Term -> Int
 initialFuel t1 t2 = max 16 (termSize t1 + termSize t2)
 
@@ -164,8 +191,12 @@ inferLamDom ctx neutral =
 --
 -- == Fuel discipline
 --
--- Fuel is consumed *only* by eta-expansion steps and path-boundary reductions.
--- Structural congruence cases do *not* consume fuel.
+-- Fuel is consumed *only* by eta-expansion steps and path-boundary reductions
+-- — the cases whose node-count argument is detailed in 'initialFuel'.
+-- Structural congruence cases (matching constructors on both sides) do *not*
+-- consume fuel; they split the comparison into sub-comparisons whose combined
+-- node count is strictly less than the current pair's, so they make progress
+-- without needing the fuel counter.
 --
 -- == Domain inference failure
 --
