@@ -90,22 +90,57 @@ eval t = case t of
 
                        -- Pi transport:
                        --   p i = Π(a : A i). B i a
-                       --   transport p f = λ a1.
-                       --     let a0 = transport (⟨i⟩ A (1-i)) a1
-                       --     in  transport (⟨i⟩ B i (transp (⟨j⟩ A (i∧j)) a1))
-                       --                  (f a0)
-                       -- We approximate with the simpler one-sided version that
-                       -- is correct for non-dependent codomains and gives a
-                       -- reasonable stuck term otherwise.
+                       --
+                       -- Full CCHM rule:
+                       --   transport p f = λ a₁.
+                       --     let a₀    = transport (⟨i⟩ A (1−i)) a₁
+                       --         fillᵢ = transport (⟨j⟩ A (i∧j)) a₀
+                       --     in  transport (⟨i⟩ B i fillᵢ) (f a₀)
+                       --
+                       -- The reverse transport  transport (⟨i⟩ A (1−i))  and the
+                       -- fill  transport (⟨j⟩ A (i∧j))  cannot be expressed in
+                       -- this term model without symbolic interval negation/meet
+                       -- in the PLam binder (PLam binds at term level, not IVar
+                       -- level, so ⟨i⟩ A(1−i) has no representation as a PLam).
+                       --
+                       -- Non-dependent codomain (B does not mention a):
+                       --   transport (⟨i⟩ Π(a:A).B i) f = λ a. transport (⟨i⟩ B i) (f a)
+                       -- This is the only case we can implement correctly here.
+                       -- All other cases are left stuck (returned as-is), which is
+                       -- the honest behaviour — a wrong reduction would be unsound.
                        (TPi argName _ _, TPi _ _ _) ->
-                           TAbs argName $
-                               let fa = TApp (shift 1 0 x') (TVar 0)
-                               in eval (TTransport
-                                           (PLam iName
-                                               (eval (TApp (beta (shift 2 0 body)
-                                                               (TInterval I1))
-                                                           (shift 2 0 (TVar 0)))))
-                                           fa)
+                           -- B-family: ⟨i⟩ B i
+                           -- Inside PLam iName, body's binder i = TVar 0.
+                           -- beta (shift 1 0 body) (TVar 0) is the identity on body
+                           -- (shift raises i to TVar 1; beta at 0 is a no-op; shift
+                           -- -1 brings it back), so the PLam body is exactly body
+                           -- with its TVar 0 still live — correct for a PLam in i.
+                           let bFam = PLam iName $
+                                   case eval (beta (shift 1 0 body) (TVar 0)) of
+                                       TPi _ _ bI -> bI   -- B i, with i = TVar 0
+                                       _          -> shift 1 0 b0B
+                               -- Check whether B is non-dependent in a (TVar 0).
+                               -- b0 = Π(a:A 0). B 0 a; the body B 0 a is b0Body,
+                               -- which is open in a = TVar 0.  B is non-dependent iff
+                               -- TVar 0 does not appear free in b0Body.
+                               -- We test this by substituting TVar 0 with a sentinel
+                               -- TUniv 0 and checking the result is unchanged; if TVar 0
+                               -- is free, the substitution changes the term.
+                               bNonDep = case b0 of
+                                   TPi _ _ b0Body ->
+                                       subst 0 (TUniv 0) b0Body == b0Body
+                                   _ -> False
+                           in if bNonDep
+                              -- Non-dependent B: safe full reduction.
+                              --   transport (⟨i⟩ Π(a:A).B i) f = λ a. transport (⟨i⟩ B i) (f a)
+                              then TAbs argName $
+                                       eval (TTransport bFam
+                                               (eval (TApp (shift 1 0 x') (TVar 0))))
+                              -- Dependent B: stuck — we cannot compute the backward
+                              -- transport or fill without symbolic interval ops.
+                              else TTransport p' x'
+                           where
+                               b0B = case b0 of TPi _ _ b -> b; _ -> b0
 
                        -- Path transport:
                        --   p i = Path (A i) (u i) (v i)

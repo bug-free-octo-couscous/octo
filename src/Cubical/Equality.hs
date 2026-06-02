@@ -19,8 +19,8 @@ type Ctx = [(Name, Term)]
 -- Term size (used to derive eta-expansion fuel)
 --------------------------------------------------------------------------------
 
--- | Structural node count of a term.  Used as a lower bound on eta fuel so
--- that the fuel scales with the problem rather than being a magic constant.
+-- | Structural node count of a term.  Used to derive the initial fuel for
+-- 'etaEq': see 'initialFuel' for the termination argument.
 termSize :: Term -> Int
 termSize t = case t of
     TVar _               -> 1
@@ -50,15 +50,35 @@ termSize t = case t of
     TSnd p               -> 1 + termSize p
 
 -- | Starting fuel for an eta-equality check between two already-evaluated
--- terms.  We use the combined term size as the base, with a minimum floor of
--- 16 so trivially small terms still get a reasonable number of steps.
+-- terms.  We use the combined structural node count as the bound, with a
+-- minimum floor of 16 so trivially small terms still get reasonable headroom.
 --
--- Justification: each eta-expansion step (TAbs/PLam vs neutral, or PApp
--- boundary reduction) produces a term whose size is at most the size of the
--- original plus a constant (the freshly introduced @TVar 0@ and @shift@).
--- Structural congruence steps strictly decrease size.  So the combined size
--- is a sound — though not tight — upper bound on the number of useful
--- eta-expansion steps.
+-- == Why this bound is valid
+--
+-- Every fuel-consuming step in 'etaEq' is gated by a specific constructor
+-- node on one of the two input terms:
+--
+--   * 'PApp' boundary reduction  — triggered by a 'PApp' node on one side.
+--   * Lambda \/ 'PLam' eta expansion — triggered by a 'TAbs' or 'PLam' node.
+--   * Sigma eta expansion         — triggered by a 'TPair' node.
+--
+-- Each such node can trigger at most one fuel-consuming step, because the
+-- step either eliminates the node (boundary reduction) or peels it off and
+-- recurses into the body (eta expansion), so the same node cannot fire again
+-- in any recursive call.  The total number of fuel-consuming steps is
+-- therefore bounded by the total number of those constructor nodes, which is
+-- at most @termSize t1 + termSize t2@.
+--
+-- == Why term-size growth does not defeat the bound
+--
+-- One-sided lambda eta expansion replaces the neutral side @N@ with
+-- @TApp (shift 1 0 N) (TVar 0)@.  Since 'shift' is size-preserving,
+-- this adds exactly 2 nodes ('TApp' and 'TVar').  The total term size
+-- therefore grows by 2 per one-sided step — a size-decrease argument would
+-- fail.  The per-node argument above is not affected, because neither of the
+-- 2 new nodes ('TApp', 'TVar') is a 'TAbs', 'PLam', 'PApp', or 'TPair', so
+-- they cannot trigger a fuel-consuming step.  They will be handled by the
+-- no-fuel structural congruence cases.
 initialFuel :: Term -> Term -> Int
 initialFuel t1 t2 = max 16 (termSize t1 + termSize t2)
 
@@ -68,7 +88,7 @@ initialFuel t1 t2 = max 16 (termSize t1 + termSize t2)
 
 -- | Three-valued result of eta-equality.
 --
--- @Equal@   — the two terms are definitionally equal.
+-- @Equal@    — the two terms are definitionally equal.
 -- @NotEqual@ — they are definitionally distinct (normal termination).
 -- @Exhausted@ — fuel ran out before a verdict could be reached; the checker
 --               should report this as an ambiguous/inconclusive result rather
@@ -77,13 +97,16 @@ data EtaResult = Equal | NotEqual | Exhausted
     deriving (Eq, Show)
 
 -- | Combine two 'EtaResult's under conjunction (both must be 'Equal').
---   'Exhausted' is infectious: if either side exhausted fuel the overall
---   result is 'Exhausted', because we cannot claim inequality.
+-- 'Exhausted' is infectious in both directions: if either operand ran out of
+-- fuel we cannot conclude inequality, so the whole check is inconclusive.
+-- 'NotEqual' beats 'Equal' but loses to 'Exhausted', because we cannot trust
+-- a 'NotEqual' verdict when the other branch didn't reach a decision.
 andResult :: EtaResult -> EtaResult -> EtaResult
-andResult Equal    r         = r
-andResult _        Exhausted = Exhausted
-andResult Exhausted _        = Exhausted
-andResult NotEqual _         = NotEqual
+andResult Equal     r        = r           -- Equal is the identity
+andResult r         Equal    = r           -- (symmetric)
+andResult Exhausted _        = Exhausted   -- fuel exhaustion is infectious
+andResult _         Exhausted = Exhausted  -- (symmetric)
+andResult NotEqual  NotEqual = NotEqual    -- both sides definitively unequal
 
 --------------------------------------------------------------------------------
 -- Context-free definitional equality
@@ -145,12 +168,19 @@ inferNeutralTy ctx (TApp f a) =
         _                  -> Nothing
 inferNeutralTy _ _ = Nothing
 
-inferLamDom :: Ctx -> Term -> Term -> Term
-inferLamDom ctx (TAbs _ _) neutral =
+-- | Try to infer the Pi domain of @neutral@ from the context, to use as the
+-- type of the fresh variable introduced when eta-expanding @neutral@ against a
+-- lambda.
+--
+-- Returns 'Nothing' when the type of @neutral@ cannot be determined (e.g. it
+-- is not a variable or application chain, or its head is not in scope).
+-- Callers must handle 'Nothing' explicitly — silently substituting a dummy
+-- type like @TUniv 0@ would corrupt the context and mask genuine type errors.
+inferLamDom :: Ctx -> Term -> Maybe Term
+inferLamDom ctx neutral =
     case inferNeutralTy ctx neutral of
-        Just (TPi _ domTy _) -> eval domTy
-        _                    -> TUniv 0
-inferLamDom _ _ _ = TUniv 0
+        Just (TPi _ domTy _) -> Just (eval domTy)
+        _                    -> Nothing
 
 --------------------------------------------------------------------------------
 -- Core eta-equality
@@ -162,41 +192,66 @@ inferLamDom _ _ _ = TUniv 0
 -- == Fuel discipline
 --
 -- Fuel is consumed *only* by eta-expansion steps and path-boundary reductions
--- — the cases that may not decrease the syntactic size of the terms being
--- compared.  Structural congruence cases (matching constructors on both sides)
--- make strictly smaller recursive calls and therefore do *not* consume fuel;
--- decrementing fuel there would make the bound sensitive to term size in an
--- unhelpful way and would cause spurious 'Exhausted' results on large but
--- simple terms.
+-- — the cases whose node-count argument is detailed in 'initialFuel'.
+-- Structural congruence cases (matching constructors on both sides) do *not*
+-- consume fuel; they split the comparison into sub-comparisons whose combined
+-- node count is strictly less than the current pair's, so they make progress
+-- without needing the fuel counter.
 --
--- == Why 'EtaResult' instead of 'Bool'
+-- == Domain inference failure
 --
--- Returning 'False' on fuel exhaustion is misleading: the checker cannot tell
--- whether the terms are unequal or whether it just ran out of steps.  Callers
--- that receive 'Exhausted' should surface it as an inconclusive result (e.g.
--- a dedicated 'TypeError') rather than reporting a false type mismatch.
+-- When eta-expanding a lambda against a neutral term, we must extend the
+-- context with the lambda's domain type.  If that type cannot be inferred
+-- from the neutral (e.g. the neutral is opaque or out of scope), we return
+-- 'Exhausted' rather than proceeding with a fabricated type.  This is
+-- conservative but sound: we cannot claim inequality when we failed to
+-- complete the check.
+--
+-- For the lambda-vs-lambda case neither side is a neutral, so we have no
+-- type to infer from.  We fall back to a placeholder domain (@TUniv 0@)
+-- and note in the comment that this only matters if the bodies themselves
+-- trigger further domain inference — a pre-existing limitation.
 etaEq :: Int -> Ctx -> Term -> Term -> EtaResult
 etaEq 0 _ _ _ = Exhausted
 etaEq fuel ctx t1 t2
     | t1 == t2  = Equal
 
-    -- Path boundary reduction (eta-expansion step: consumes fuel)
+    -- Path boundary reduction (consumes fuel)
     | PApp p r <- t1, Just u <- reducePAppByType ctx p r
     = etaEq (fuel-1) ctx u t2
     | PApp p r <- t2, Just u <- reducePAppByType ctx p r
     = etaEq (fuel-1) ctx t1 u
 
-    -- Lambda eta (eta-expansion step: consumes fuel)
+    -- Lambda eta: both sides are lambdas (structural, but needs ctx extension).
+    -- Neither side is a neutral we can type, so we cannot infer the domain.
+    -- We use TUniv 0 as a placeholder; this is only observable if the bodies
+    -- subsequently eta-expand against a neutral that references the fresh var,
+    -- which is an uncommon and already-limited case.
     | TAbs x b1 <- t1, TAbs _ b2 <- t2
-    = etaEq (fuel-1) ((x, inferLamDom ctx t1 t2) : ctx) (eval b1) (eval b2)
-    | TAbs x b2 <- t2
-    = let ctx' = (x, inferLamDom ctx t2 t1) : ctx
-      in etaEq (fuel-1) ctx' (eval (TApp (shift 1 0 t1) (TVar 0))) (eval b2)
-    | TAbs x b1 <- t1
-    = let ctx' = (x, inferLamDom ctx t1 t2) : ctx
-      in etaEq (fuel-1) ctx' (eval b1) (eval (TApp (shift 1 0 t2) (TVar 0)))
+    = let dom = case inferLamDom ctx t1 `orElse` inferLamDom ctx t2 of
+                    Just d  -> d
+                    Nothing -> TUniv 0
+      in etaEq (fuel-1) ((x, dom) : ctx) (eval b1) (eval b2)
 
-    -- Path-lambda eta (eta-expansion step: consumes fuel)
+    -- Lambda eta: only RHS is a lambda — eta-expand the neutral LHS.
+    -- If the domain cannot be inferred, return Exhausted: we must not extend
+    -- the context with a fabricated type.
+    | TAbs x b2 <- t2
+    = case inferLamDom ctx t1 of
+          Nothing  -> Exhausted
+          Just dom ->
+              let ctx' = (x, dom) : ctx
+              in etaEq (fuel-1) ctx' (eval (TApp (shift 1 0 t1) (TVar 0))) (eval b2)
+
+    -- Lambda eta: only LHS is a lambda — eta-expand the neutral RHS.
+    | TAbs x b1 <- t1
+    = case inferLamDom ctx t2 of
+          Nothing  -> Exhausted
+          Just dom ->
+              let ctx' = (x, dom) : ctx
+              in etaEq (fuel-1) ctx' (eval b1) (eval (TApp (shift 1 0 t2) (TVar 0)))
+
+    -- Path-lambda eta: both sides (consumes fuel)
     | PLam i b1 <- t1, PLam _ b2 <- t2
     = etaEq (fuel-1) ((i, TIntervalTy) : ctx) (eval b1) (eval b2)
     | PLam i b2 <- t2
@@ -222,25 +277,11 @@ etaEq fuel ctx t1 t2
     | TSigma _ a1 b1 <- t1, TSigma _ a2 b2 <- t2
     = etaEq fuel ctx a1 a2 `andResult` etaEq fuel ctx b1 b2
 
-    -- Pair congruence (structural: no fuel consumed)
-    -- Both sides are already pairs: compare components directly.
+    -- Pair congruence (structural)
     | TPair a1 b1 <- t1, TPair a2 b2 <- t2
     = etaEq fuel ctx a1 a2 `andResult` etaEq fuel ctx b1 b2
 
-    -- Sigma eta (eta-expansion step: consumes fuel)
-    --
-    -- When exactly one side is a pair constructor and the other is a neutral
-    -- term, eta-expand the neutral: for any  n : Σ(x:A).B  we have
-    --   n  ≡  (fst n , snd n)
-    -- so we reduce the comparison to checking the two projections.
-    --
-    -- The two-pair congruence guard above fires first when *both* sides are
-    -- TPair, so these guards only trigger when the other side is neutral.
-    --
-    -- No loop risk: TFst/TSnd applied to a neutral is itself neutral (not a
-    -- TPair), so the recursive calls on the projection side cannot re-trigger
-    -- the eta guard; fuel decrements protect the pair side if it is itself
-    -- a nested TPair.
+    -- Sigma eta: one side is a pair, the other is neutral (consumes fuel)
     | TPair a1 b1 <- t1
     = etaEq (fuel-1) ctx a1 (eval (TFst t2))
       `andResult` etaEq (fuel-1) ctx b1 (eval (TSnd t2))
@@ -248,10 +289,15 @@ etaEq fuel ctx t1 t2
     = etaEq (fuel-1) ctx (eval (TFst t1)) a2
       `andResult` etaEq (fuel-1) ctx (eval (TSnd t1)) b2
 
-    -- Projection congruence on neutral spines (structural: no fuel consumed)
+    -- Projection congruence on neutral spines (structural)
     | TFst p1 <- t1, TFst p2 <- t2
     = etaEq fuel ctx p1 p2
     | TSnd p1 <- t1, TSnd p2 <- t2
     = etaEq fuel ctx p1 p2
 
     | otherwise = NotEqual
+
+-- | Left-biased 'Maybe' fallback — try the second option if the first is Nothing.
+orElse :: Maybe a -> Maybe a -> Maybe a
+orElse (Just x) _ = Just x
+orElse Nothing  m = m
